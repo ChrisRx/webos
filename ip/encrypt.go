@@ -33,7 +33,7 @@ func NewEncoder(key string) (*Encoder, error) {
 }
 
 func (e *Encoder) Encode(plaintext []byte) []byte {
-	plaintext = pad(append(plaintext, []byte("\r")...), e.b.BlockSize())
+	plaintext = pad(append(plaintext, '\r'), e.b.BlockSize())
 	ciphertext := make([]byte, len(plaintext))
 	iv := make([]byte, aes.BlockSize)
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {

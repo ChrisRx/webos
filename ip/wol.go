@@ -2,6 +2,8 @@ package ip
 
 import (
 	"bytes"
+	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -45,6 +47,10 @@ func SendWOLPacket(addr string, timeout time.Duration) error {
 			magic[index] = byte(v)
 		}
 	}
+	slog.Default().Debug("magic packet sent",
+		slog.String("mac", addr),
+		slog.String("packet", fmt.Sprintf("%X", magic)),
+	)
 	if _, err := conn.WriteTo(magic, raddr); err != nil {
 		return err
 	}

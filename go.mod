@@ -6,6 +6,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/spf13/cobra v1.9.1
+	go.chrisrx.dev/group v0.1.0
 	go.chrisrx.dev/x v0.0.0-20250218153449-f3c58bf591bb
 )
 

@@ -2,14 +2,20 @@ package ip
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.chrisrx.dev/group"
 	"go.chrisrx.dev/x/run"
 )
 
@@ -21,18 +27,26 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
+func WithMACAddress(addr string) Option {
+	return func(client *Client) {
+		client.macAddr = addr
+	}
+}
+
 type Client struct {
+	mu        sync.Mutex
+	conn      net.Conn
+	connected atomic.Bool
+	enc       *Encoder
+	q         chan string
+	state     State
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu    sync.Mutex
-	conn  net.Conn
-	enc   *Encoder
-	q     chan string
-	state State
-
-	addr   string
-	logger *slog.Logger
+	addr    string
+	macAddr string
+	logger  *slog.Logger
 }
 
 func New(addr, key string, opts ...Option) (*Client, error) {
@@ -51,22 +65,21 @@ func New(addr, key string, opts ...Option) (*Client, error) {
 	}
 	c.ctx, c.cancel = context.WithCancel(context.TODO())
 
-	if err := c.connect(); err != nil {
-		return nil, err
-	}
-
-	go c.process()
+	go run.Until(c.ctx, c.connect, 1*time.Second)
 	go run.Every(c.ctx, func() error {
-		ctx, cancel := context.WithTimeout(c.ctx, 1*time.Second)
-		defer cancel()
-		_ = c.Send(ctx, "GET_MACADDRESS wired")
-		_ = c.Send(ctx, "GET_MACADDRESS wifi")
-		_ = c.Send(ctx, "MUTE_STATE")
-		_ = c.Send(ctx, "CURRENT_VOL")
-		_ = c.Send(ctx, "CURRENT_APP")
-		_ = c.Send(ctx, "GET_IPCONTROL_STATE")
+		if !c.connected.Load() {
+			return nil
+		}
+		c.Send("GET_MACADDRESS wired")
+		c.Send("GET_MACADDRESS wifi")
+		c.Send("MUTE_STATE")
+		c.Send("CURRENT_VOL")
+		c.Send("CURRENT_APP")
+		c.Send("GET_IPCONTROL_STATE")
 		return nil
 	}, 5*time.Second)
+
+	go c.process()
 
 	return c, nil
 }
@@ -86,6 +99,7 @@ func (c *Client) connect() error {
 		return err
 	}
 	c.conn = conn
+	c.connected.Store(true)
 	return nil
 }
 
@@ -121,6 +135,7 @@ func (c *Client) process() {
 			logger := c.logger.With(slog.String("command", cmd))
 			resp, err := c.send(cmd)
 			if err != nil {
+				c.connected.Store(false)
 				c.logger.Error("cannot send command", slog.Any("error", err))
 				_ = run.Until(c.ctx, c.connect, 1*time.Second)
 				continue
@@ -134,7 +149,11 @@ func (c *Client) process() {
 			case "MUTE_STATE":
 				c.state.MuteState = parseBool(strings.TrimPrefix(resp, "MUTE:"))
 			case "CURRENT_VOL":
-				i, err := strconv.ParseInt(strings.TrimPrefix(resp, "VOL:"), 10, 64)
+				volume := strings.TrimPrefix(resp, "VOL:")
+				if volume == "" {
+					continue
+				}
+				i, err := strconv.ParseInt(volume, 10, 64)
 				if err != nil {
 					logger.Error("cannot parse command response", slog.Any("error", err))
 					continue
@@ -148,7 +167,7 @@ func (c *Client) process() {
 				}
 			default:
 				if resp != "OK" {
-					c.logger.Error("invalid command")
+					logger.Error("invalid command")
 				}
 			}
 		case <-c.ctx.Done():
@@ -182,7 +201,13 @@ func (c *Client) send(command string) (string, error) {
 	b := make([]byte, 1024)
 	n, err := c.conn.Read(b)
 	if err != nil {
-		if err == io.EOF {
+		// If the read deadline is exceeded, it can be assumed that the write
+		// to the connection was successful. This indicates that most likely
+		// the connection is still open but the device didn't return a response
+		// due to, for example, receiving an invalid command. It is important
+		// to return no error in this situation to prevent signaling that the
+		// connection should attempt reconnecting.
+		if err == io.EOF || errors.Is(err, os.ErrDeadlineExceeded) {
 			return "", nil
 		}
 		return "", err
@@ -194,11 +219,96 @@ func (c *Client) send(command string) (string, error) {
 	return strings.TrimSpace(string(plaintext)), nil
 }
 
-func (c *Client) Send(ctx context.Context, command string) error {
+func (c *Client) MustSend(ctx context.Context, command string) error {
 	select {
 	case c.q <- command:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+const defaultCommandTimeout = 100 * time.Millisecond
+
+func (c *Client) Send(command string) {
+	ctx, cancel := context.WithTimeout(c.ctx, defaultCommandTimeout)
+	defer cancel()
+
+	select {
+	case c.q <- command:
+	case <-ctx.Done():
+		c.logger.Debug("sending command timed out",
+			slog.String("command", command),
+			slog.Duration("timeout", defaultCommandTimeout),
+		)
+	}
+}
+
+var (
+	inputs = []string{
+		"hdmi1",
+		"hdmi2",
+		"hdmi3",
+		"hdmi4",
+		"atv",
+		"dtv",
+		"av1",
+		"component1",
+	}
+
+	inputNameMap = map[string]string{
+		"hdmi1":      "hdmi1", // com.webos.app.hdmi1
+		"hdmi2":      "hdmi2",
+		"hdmi3":      "hdmi3",
+		"hdmi4":      "hdmi4",
+		"atv":        "atv",
+		"dtv":        "dtv",
+		"av1":        "av1",
+		"component1": "component1",
+		"youtube":    "youtube.leanback.v4",
+	}
+)
+
+func (c *Client) ChangeInput(input string) error {
+	name, ok := inputNameMap[input]
+	if !ok {
+		return fmt.Errorf("invalid input name: %q", input)
+	}
+	var command string
+	if slices.Contains(inputs, name) {
+		command = fmt.Sprintf("INPUT_SELECT %s", name)
+	} else {
+		command = fmt.Sprintf("APP_LAUNCH %s", name)
+	}
+	c.logger.Debug("input command",
+		slog.String("input", input),
+		slog.String("command", command),
+	)
+	ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
+	defer cancel()
+	defer c.Send("CURRENT_APP")
+	return c.MustSend(ctx, command)
+}
+
+func (c *Client) PowerOff() error {
+	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+	defer cancel()
+
+	return c.MustSend(ctx, "POWER off")
+}
+
+func (c *Client) PowerOn() error {
+	if c.state.MACAddressWifi == "" && c.state.MACAddressWired == "" && c.macAddr == "" {
+		return fmt.Errorf("mac address must be provided to send WOL packet")
+	}
+	g := group.New(c.ctx)
+	for _, addr := range []string{c.state.MACAddressWifi, c.state.MACAddressWired, c.macAddr} {
+		if addr == "" {
+			continue
+		}
+		g.Go(func(ctx context.Context) error {
+			return SendWOLPacket(strings.ToLower(addr), 5*time.Second)
+		})
+	}
+	return g.Wait()
 }

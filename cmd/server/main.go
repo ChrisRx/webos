@@ -14,8 +14,9 @@ import (
 )
 
 var opts struct {
-	Host string
-	Key  string
+	Host    string
+	Key     string
+	MACAddr string
 }
 
 func main() {
@@ -25,14 +26,16 @@ func main() {
 			if opts.Host == "" {
 				return fmt.Errorf("must provide Host")
 			}
-			if opts.Host == "" {
+			if opts.Key == "" {
 				return fmt.Errorf("must provide Key")
 			}
 
-			logger := log.New(log.WithFormat(log.JSONFormat))
-
-			addr := fmt.Sprintf("%s:9761", opts.Host)
-			client, err := ip.New(addr, opts.Key, ip.WithLogger(logger))
+			var ipopts []ip.Option
+			ipopts = append(ipopts, ip.WithLogger(log.New(log.WithFormat(log.JSONFormat))))
+			if opts.MACAddr != "" {
+				ipopts = append(ipopts, ip.WithMACAddress(opts.MACAddr))
+			}
+			client, err := ip.New(fmt.Sprintf("%s:9761", opts.Host), opts.Key, ipopts...)
 			if err != nil {
 				return err
 			}
@@ -44,15 +47,11 @@ func main() {
 			e.Use(middleware.Logger())
 			e.Use(middleware.Recover())
 
+			// TODO(chrism): Should be able to handle multiple devices.
+
 			// routes
 			e.GET("/button", func(c echo.Context) error {
-				command := fmt.Sprintf("KEY_ACTION %s", c.QueryParam("name"))
-				if err := client.Send(c.Request().Context(), command); err != nil {
-					return c.JSON(http.StatusBadRequest, map[string]any{
-						"status": http.StatusBadRequest,
-						"error":  err,
-					})
-				}
+				client.Send(fmt.Sprintf("KEY_ACTION %s", c.QueryParam("name")))
 				return c.JSON(http.StatusOK, map[string]any{
 					"status": http.StatusOK,
 				})
@@ -60,6 +59,40 @@ func main() {
 
 			e.GET("/state", func(c echo.Context) error {
 				return c.JSON(http.StatusOK, client.GetState())
+			})
+
+			e.GET("/input", func(c echo.Context) error {
+				if err := client.ChangeInput(c.QueryParam("name")); err != nil {
+					return c.JSON(http.StatusBadRequest, map[string]any{
+						"status": http.StatusBadRequest,
+						"error":  err.Error(),
+					})
+				}
+				return c.JSON(http.StatusOK, client.GetState())
+			})
+
+			e.GET("/poweroff", func(c echo.Context) error {
+				if err := client.PowerOff(); err != nil {
+					return c.JSON(http.StatusBadRequest, map[string]any{
+						"status": http.StatusBadRequest,
+						"error":  err.Error(),
+					})
+				}
+				return c.JSON(http.StatusOK, map[string]any{
+					"status": http.StatusOK,
+				})
+			})
+
+			e.GET("/poweron", func(c echo.Context) error {
+				if err := client.PowerOn(); err != nil {
+					return c.JSON(http.StatusBadRequest, map[string]any{
+						"status": http.StatusBadRequest,
+						"error":  err.Error(),
+					})
+				}
+				return c.JSON(http.StatusOK, map[string]any{
+					"status": http.StatusOK,
+				})
 			})
 
 			// run
@@ -72,6 +105,7 @@ func main() {
 
 	cmd.Flags().StringVarP(&opts.Host, "host", "H", "", "")
 	cmd.Flags().StringVar(&opts.Key, "key", "", "")
+	cmd.Flags().StringVar(&opts.MACAddr, "mac-addr", "", "")
 
 	if err := cmd.Execute(); err != nil {
 		log.Fatal(err)
