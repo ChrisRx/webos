@@ -7,7 +7,7 @@ require (
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/spf13/cobra v1.9.1
 	go.chrisrx.dev/group v0.1.0
-	go.chrisrx.dev/x v0.0.0-20250218153449-f3c58bf591bb
+	go.chrisrx.dev/x v0.0.0-20250309195830-d80a014a0000
 )
 
 require (

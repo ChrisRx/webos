@@ -30,8 +30,9 @@ func main() {
 				return fmt.Errorf("must provide Key")
 			}
 
-			var ipopts []ip.Option
-			ipopts = append(ipopts, ip.WithLogger(log.New(log.WithFormat(log.JSONFormat))))
+			ipopts := []ip.Option{
+				ip.WithLogger(log.New(log.WithFormat(log.JSONFormat))),
+			}
 			if opts.MACAddr != "" {
 				ipopts = append(ipopts, ip.WithMACAddress(opts.MACAddr))
 			}

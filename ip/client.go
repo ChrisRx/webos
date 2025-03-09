@@ -65,10 +65,20 @@ func New(addr, key string, opts ...Option) (*Client, error) {
 	}
 	c.ctx, c.cancel = context.WithCancel(context.TODO())
 
-	go run.Until(c.ctx, c.connect, 1*time.Second)
-	go run.Every(c.ctx, func() error {
+	// The underlying tcp connection is established asynchronously to allow
+	// clients to be constructed even if the device is currently unavailable.
+	go run.Until(c.ctx, func() bool {
+		if err := c.connect(); err != nil {
+			c.logger.Error("connection attempt failed", slog.Any("error", err))
+			return false
+		}
+		return true
+	}, 1*time.Second)
+
+	// Query-based commands are scheduled periodically to update device state.
+	go run.Every(c.ctx, func() {
 		if !c.connected.Load() {
-			return nil
+			return
 		}
 		c.Send("GET_MACADDRESS wired")
 		c.Send("GET_MACADDRESS wifi")
@@ -76,7 +86,6 @@ func New(addr, key string, opts ...Option) (*Client, error) {
 		c.Send("CURRENT_VOL")
 		c.Send("CURRENT_APP")
 		c.Send("GET_IPCONTROL_STATE")
-		return nil
 	}, 5*time.Second)
 
 	go c.process()
@@ -90,7 +99,7 @@ func (c *Client) connect() error {
 
 	logger := c.logger.With(slog.String("addr", c.addr))
 	logger.Info("attempting connection...")
-	conn, err := net.Dial("tcp", c.addr)
+	conn, err := (&net.Dialer{Timeout: 1 * time.Second}).DialContext(c.ctx, "tcp", c.addr)
 	if err != nil {
 		return err
 	}
@@ -137,7 +146,16 @@ func (c *Client) process() {
 			if err != nil {
 				c.connected.Store(false)
 				c.logger.Error("cannot send command", slog.Any("error", err))
-				_ = run.Until(c.ctx, c.connect, 1*time.Second)
+
+				for attempt, err := range run.Retry(c.ctx, c.connect, run.RetryOptions{
+					InitialInterval: 100 * time.Millisecond,
+					MaxInterval:     5 * time.Minute,
+				}) {
+					c.logger.Debug("connection attempt failed",
+						slog.Any("error", err),
+						slog.Int("attempt", attempt),
+					)
+				}
 				continue
 			}
 			logger = logger.With(slog.String("response", resp))
@@ -284,10 +302,29 @@ func (c *Client) ChangeInput(input string) error {
 		slog.String("input", input),
 		slog.String("command", command),
 	)
-	ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
+	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 	defer cancel()
-	defer c.Send("CURRENT_APP")
-	return c.MustSend(ctx, command)
+
+	if err := c.MustSend(ctx, command); err != nil {
+		return err
+	}
+
+	ready := make(chan struct{})
+	go run.Until(ctx, func() bool {
+		if strings.Contains(c.state.CurrentApp, input) {
+			close(ready)
+			return true
+		}
+		c.Send(command)
+		return false
+	}, 100*time.Millisecond)
+
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("timed out waiting for input change: %q", input)
+	}
 }
 
 func (c *Client) PowerOff() error {
